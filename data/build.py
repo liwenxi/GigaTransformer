@@ -102,6 +102,17 @@ def build_dataset(is_train, config):
             root = os.path.join(config.DATA.DATA_PATH, prefix)
             dataset = datasets.ImageFolder(root, transform=transform)
         nb_classes = 1000
+    elif config.DATA.DATASET == 'camelyon16':
+        prefix = 'train' if is_train else 'val'
+        if config.DATA.ZIP_MODE:
+            ann_file = prefix + "_map.txt"
+            prefix = prefix + ".zip@/"
+            dataset = CachedImageFolder(config.DATA.DATA_PATH, ann_file, prefix, transform,
+                                        cache_mode=config.DATA.CACHE_MODE if is_train else 'part')
+        else:
+            root = os.path.join(config.DATA.DATA_PATH, prefix)
+            dataset = datasets.ImageFolder(root, transform=transform)
+        nb_classes = 2
     elif config.DATA.DATASET == 'imagenet22K':
         raise NotImplementedError("Imagenet-22K will come soon.")
     else:
@@ -133,7 +144,8 @@ def build_transform(is_train, config):
     t = []
     if resize_im:
         if config.TEST.CROP:
-            size = int((256 / 224) * config.DATA.IMG_SIZE)
+            # size = int((256 / 224) * config.DATA.IMG_SIZE)
+            size = int(config.DATA.IMG_SIZE)
             t.append(
                 transforms.Resize(size, interpolation=_pil_interp(config.DATA.INTERPOLATION)),
                 # to maintain same ratio w.r.t. 224 images

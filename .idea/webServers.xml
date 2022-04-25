@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="c74b0bdf-e45f-4f4a-a452-708e7b343b12" name="SY">
+        <fileTransfer rootFolder="/dssg/home/acct-eexdl/eexdl/liwenxi/GigaTransformer" accessType="SFTP" host="sylogin1.hpc.sjtu.edu.cn" port="22" sshConfigId="674f9208-b1ae-46af-9a41-79c14be129e5" sshConfig="eexdl@sylogin1.hpc.sjtu.edu.cn:22 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>

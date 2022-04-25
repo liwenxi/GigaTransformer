@@ -4,28 +4,34 @@
 # Licensed under The MIT License [see LICENSE for details]
 # Written by Ze Liu
 # --------------------------------------------------------
-
+import glob
 import os
+import shutil
 import time
 import random
 import argparse
 import datetime
+
+import PIL.Image
+import cv2
 import numpy as np
 
 import torch
 import torch.backends.cudnn as cudnn
 import torch.distributed as dist
+import tqdm
 
 from timm.loss import LabelSmoothingCrossEntropy, SoftTargetCrossEntropy
 from timm.utils import accuracy, AverageMeter
 
 from config import get_config
 from models import build_model
-from data import build_loader
+from data import build_loader, build_transform
 from lr_scheduler import build_scheduler
 from optimizer import build_optimizer
 from logger import create_logger
 from utils import load_checkpoint, load_pretrained, save_checkpoint, get_grad_norm, auto_resume_helper, reduce_tensor
+
 
 try:
     # noinspection PyUnresolvedReferences
@@ -77,16 +83,14 @@ def parse_option():
 
 
 def main(config):
-    dataset_train, dataset_val, data_loader_train, data_loader_val, mixup_fn = build_loader(config)
-
     logger.info(f"Creating model:{config.MODEL.TYPE}/{config.MODEL.NAME}")
     model = build_model(config)
     model.cuda()
+    model.eval()
     logger.info(str(model))
 
-    optimizer = build_optimizer(config, model)
-    if config.AMP_OPT_LEVEL != "O0":
-        model, optimizer = amp.initialize(model, optimizer, opt_level=config.AMP_OPT_LEVEL)
+    # if config.AMP_OPT_LEVEL != "O0":
+    #     model, optimizer = amp.initialize(model, optimizer, opt_level=config.AMP_OPT_LEVEL)
     model = torch.nn.parallel.DistributedDataParallel(model, device_ids=[config.LOCAL_RANK], broadcast_buffers=False)
     model_without_ddp = model.module
 
@@ -96,17 +100,7 @@ def main(config):
         flops = model_without_ddp.flops()
         logger.info(f"number of GFLOPs: {flops / 1e9}")
 
-    lr_scheduler = build_scheduler(config, optimizer, len(data_loader_train))
-
-    if config.AUG.MIXUP > 0.:
-        # smoothing is handled with mixup label transform
-        criterion = SoftTargetCrossEntropy()
-    elif config.MODEL.LABEL_SMOOTHING > 0.:
-        criterion = LabelSmoothingCrossEntropy(smoothing=config.MODEL.LABEL_SMOOTHING)
-    else:
-        criterion = torch.nn.CrossEntropyLoss()
-
-    max_accuracy = 0.0
+    transform = build_transform(is_train=False, config=config)
 
     if config.TRAIN.AUTO_RESUME:
         resume_file = auto_resume_helper(config.OUTPUT)
@@ -119,43 +113,55 @@ def main(config):
             logger.info(f'auto resuming from {resume_file}')
         else:
             logger.info(f'no checkpoint found in {config.OUTPUT}, ignoring auto resume')
+    model_without_ddp = model.module
+    # checkpoint = torch.load(config.MODEL.RESUME, map_location='cpu')
+    checkpoint = torch.load('output/giga_patch16_stride6_window7_672/default/ckpt_epoch_98.pth', map_location='cpu')
+    print('output/giga_patch16_stride6_window7_672/default/ckpt_epoch_98.pth')
+    msg = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+    logger.info(msg)
+    val_root = os.path.join(config.DATA.DATA_PATH, 'val')
+    condition_img_paths = glob.glob(os.path.join(val_root, 'normal', '*.png'))
 
-    if config.MODEL.RESUME:
-        max_accuracy = load_checkpoint(config, model_without_ddp, optimizer, lr_scheduler, logger)
-        # acc1, acc5, loss = validate(config, data_loader_val, model)
-        acc1, loss = validate(config, data_loader_val, model)
-        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
-        if config.EVAL_MODE:
-            return
 
-    if config.MODEL.PRETRAINED and (not config.MODEL.RESUME):
-        load_pretrained(config, model_without_ddp, logger)
-        # acc1, acc5, loss = validate(config, data_loader_val, model)
-        acc1, loss = validate(config, data_loader_val, model)
-        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
+    visualization_root = './visualization'
+    if not os.path.exists(visualization_root):
+        os.makedirs(visualization_root)
 
-    if config.THROUGHPUT_MODE:
-        throughput(data_loader_val, model, logger)
-        return
+    count = 0
+    for img_path in tqdm.tqdm(condition_img_paths):
+        img = PIL.Image.open(img_path)
+        name = os.path.basename(img_path)
+        img_tensor = transform(img)
+        img_tensor = img_tensor.cuda().unsqueeze(0)
 
-    logger.info("Start training")
-    start_time = time.time()
-    for epoch in range(config.TRAIN.START_EPOCH, config.TRAIN.EPOCHS):
-        data_loader_train.sampler.set_epoch(epoch)
+        # compute output
+        output = model(img_tensor)
+        _, pred = output.topk(1, 1, True, True)
+        if pred.item() == 1:
+            count += 1
+    print(count)
+            # shutil.copyfile(img_path, os.path.join(visualization_root, name))
+            # GRID_SIZE = 16
+            # img = np.array(img)
+            # height, width, channels = img.shape
+            # for x in range(0, width - 1, GRID_SIZE):
+            #     if x//GRID_SIZE % 6 == 0 or x//GRID_SIZE % 6 == 1:
+            #         cv2.line(img, (x, 0), (x, height), (255, 255, 255), 1, 1)
+            #     else:
+            #         pass
+            #         # cv2.line(img, (x, 0), (x, height), (0, 0, 0, ), 1, 1)
+            # for y in range(0, height - 1, GRID_SIZE):
+            #     if y//GRID_SIZE % 6 == 0 or y//GRID_SIZE % 6 == 1:
+            #         cv2.line(img, (0, y), (width, y), (255, 255, 255), 1, 1)
+            #     else:
+            #         pass
+            # img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            # cv2.imwrite(os.path.join(visualization_root, name), img)
 
-        train_one_epoch(config, model, criterion, data_loader_train, optimizer, epoch, mixup_fn, lr_scheduler)
-        if dist.get_rank() == 0 and (epoch % config.SAVE_FREQ == 0 or epoch == (config.TRAIN.EPOCHS - 1)):
-            save_checkpoint(config, epoch, model_without_ddp, max_accuracy, optimizer, lr_scheduler, logger)
 
-        # acc1, acc5, loss = validate(config, data_loader_val, model)
-        acc1, loss = validate(config, data_loader_val, model)
-        logger.info(f"Accuracy of the network on the {len(dataset_val)} test images: {acc1:.1f}%")
-        max_accuracy = max(max_accuracy, acc1)
-        logger.info(f'Max accuracy: {max_accuracy:.2f}%')
 
-    total_time = time.time() - start_time
-    total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-    logger.info('Training time {}'.format(total_time_str))
+
+
 
 
 def train_one_epoch(config, model, criterion, data_loader, optimizer, epoch, mixup_fn, lr_scheduler):
@@ -288,25 +294,6 @@ def validate(config, data_loader, model):
     logger.info(f' * Acc@1 {acc1_meter.avg:.3f}')
     return acc1_meter.avg, loss_meter.avg
 
-
-@torch.no_grad()
-def throughput(data_loader, model, logger):
-    model.eval()
-
-    for idx, (images, _) in enumerate(data_loader):
-        images = images.cuda(non_blocking=True)
-        batch_size = images.shape[0]
-        for i in range(50):
-            model(images)
-        torch.cuda.synchronize()
-        logger.info(f"throughput averaged with 30 times")
-        tic1 = time.time()
-        for i in range(30):
-            model(images)
-        torch.cuda.synchronize()
-        tic2 = time.time()
-        logger.info(f"batch_size {batch_size} throughput {30 * batch_size / (tic2 - tic1)}")
-        return
 
 
 if __name__ == '__main__':
